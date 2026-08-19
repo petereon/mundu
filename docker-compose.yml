@@ -1,0 +1,121 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: mundu
+      POSTGRES_PASSWORD: mundu
+      POSTGRES_DB: mundu
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mundu -d mundu"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - mundu-pgdata:/var/lib/postgresql/data
+
+  # The database the integration suite runs against.
+  #
+  # Separate from `postgres` because the suite is destructive by construction:
+  # it deletes whole tenants to make its assertions repeatable, and the
+  # relationship-coercion tests write into `tenant_id = ''`, the curated global
+  # vocabulary every tenant reads. Pointed at a database somebody is also using
+  # for real, that is not clutter, it is data loss -- so the two are different
+  # servers on different ports rather than different schemas on one.
+  #
+  # `tests/common/mod.rs` refuses to run against any database holding a
+  # non-test tenant, which is the protection that survives someone exporting
+  # DATABASE_URL. This service is what makes the safe path the default one.
+  postgres-test:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: mundu
+      POSTGRES_PASSWORD: mundu
+      POSTGRES_DB: mundu
+    ports:
+      # 55433, one above the development database. Close enough to be obviously
+      # related, different enough that a mistyped port fails to connect rather
+      # than connecting to the wrong one.
+      - "55433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mundu -d mundu"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # tmpfs, not a named volume. A test database has nothing worth surviving a
+    # restart: every test creates what it asserts on, and the schema comes from
+    # the embedded migrations on connect. Making that explicit buys three
+    # things -- writes never reach the disk, so the suite is faster; the
+    # database resets itself whenever the container is recreated, so a run can
+    # never inherit junk from the last one; and there is no named volume to
+    # confuse with `mundu-pgdata` when someone reaches for `docker volume rm`.
+    #
+    # The cap matters: an unbounded tmpfs defaults to half of host RAM, so a
+    # runaway test would evict the machine rather than fail. 2g is far above
+    # what the suite uses (a fresh cluster plus its data is well under 200 MB)
+    # and far below anything that would hurt.
+    tmpfs:
+      - /var/lib/postgresql/data:size=2g
+
+  mundu:
+    build: .
+    image: mundu:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "18200:8080"
+    environment:
+      MUNDU_BIND: "0.0.0.0:8080"
+      # The service name, not localhost: inside the compose network postgres is
+      # a DNS name and the 55432 host mapping does not exist.
+      MUNDU_DATABASE_URL: "postgres://mundu:mundu@postgres:5432/mundu"
+
+      MUNDU_AUTH_MODE: "token"
+      MUNDU_STATIC_TOKENS: "${MUNDU_STATIC_TOKENS:?set MUNDU_STATIC_TOKENS in .env}"
+
+      # Every MCP client that exists today still negotiates 2025-11-25. Under
+      # modern-only they complete `initialize` and then fail every call, which
+      # looks like a working connection. See docs/plans/follow-ups.md.
+      MUNDU_PROTOCOL_COMPAT: "dual-era"
+
+      # The listener is on 0.0.0.0 inside the container, but the Host header a
+      # client sends is whatever it dialled on the host side.
+      MUNDU_ALLOWED_HOSTS: "localhost,127.0.0.1,[::1],mundu"
+
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      # Model weights live in the host cache rather than the image: baking in
+      # ~440MB would make the image far larger, and re-downloading on every
+      # start would make a container restart a network operation.
+      - "${HOME}/.cache/huggingface:/home/mundu/.cache/huggingface"
+    restart: unless-stopped
+
+  viz:
+    build:
+      context: .
+      # Its own image, not the server's. See the Dockerfile: an image with no
+      # viewer binary in it cannot be misconfigured into serving one.
+      target: viz
+    image: mundu-viz:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Published to the host's loopback only. That is the confinement the binary
+    # would otherwise enforce itself -- it reads every tenant and asks for no
+    # credential, so this line is the whole access control. Widening it to
+    # "18301:8080" would put the entire graph on the network.
+    ports:
+      - "127.0.0.1:18301:8080"
+    environment:
+      # 0.0.0.0 inside the container is the container's namespace, not the
+      # host's; binding loopback here would be reachable by nobody at all.
+      MUNDU_VIZ_BIND: "0.0.0.0:8080"
+      MUNDU_VIZ_ALLOW_NON_LOOPBACK: "1"
+      MUNDU_DATABASE_URL: "postgres://mundu:mundu@postgres:5432/mundu"
+      RUST_LOG: "${RUST_LOG:-info}"
+    restart: unless-stopped
+
+volumes:
+  mundu-pgdata:

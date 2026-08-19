@@ -1,0 +1,10 @@
+# The build context is uploaded to the daemon before anything runs, and
+# target/ alone is tens of gigabytes of host-architecture artefacts that the
+# Linux build inside the image cannot use anyway.
+target/
+.git/
+docs/
+
+# Nothing here is needed to build or run the server.
+*.md
+.github/

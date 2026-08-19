@@ -1,0 +1,128 @@
+[package]
+name = "mundu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "A stateless MCP 2026-07-28 memory server backed by a bi-temporal property graph and pgvector"
+
+[features]
+default = ["candle-embedder"]
+# Local ONNX-free embedding via candle. Pulls in a large dependency tree and
+# downloads model weights from the HuggingFace hub on first use.
+candle-embedder = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+# Apple GPU acceleration for the candle embedder.
+metal = ["candle-core?/metal", "candle-nn?/metal", "candle-transformers?/metal"]
+
+# Both binaries are spelled out rather than left to auto-discovery, because
+# `calibrate` needs `required-features` and a target that is half implicit and
+# half declared is the kind of thing that works until someone adds a third.
+[[bin]]
+name = "mundu"
+path = "src/main.rs"
+
+# The calibration harness. It measures the real model, so it cannot be built
+# without it: `required-features` makes `cargo build --no-default-features`
+# skip the target instead of failing to resolve `CandleEmbedder`.
+# The graph viewer. Loopback-only and read-only, and needs no embedder -- so it
+# is deliberately buildable without the candle feature, unlike calibrate.
+[[bin]]
+name = "viz"
+path = "src/bin/viz.rs"
+
+[[bin]]
+name = "calibrate"
+path = "src/bin/calibrate.rs"
+required-features = ["candle-embedder"]
+
+[dependencies]
+rmcp = { version = "3.1.1", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+    # stdio, for local development only.
+    "transport-io",
+    # MRTR disambiguation. `request-state` provides RequestStateCodec, which
+    # HMAC-seals progress into the client-echoed requestState. Sealing is not
+    # optional: the client returns that blob verbatim, so unsealed state is
+    # attacker-controlled input that could redirect which nodes an edge binds to.
+    "request-state",
+    "elicitation",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+http = "1"
+
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "uuid",
+    "chrono",
+    "migrate",
+    "macros",
+] }
+# No `pgvector` crate. It declares `sqlx >= 0.8, < 0.10`, but its Type/Encode
+# impls are generated against sqlx 0.8 specifically, so `bind()` rejects its
+# Vector under sqlx 0.9 ("expected sqlx-core 0.9.0 Type, found 0.8.6") and it
+# drags a second full copy of sqlx into the build. Vectors are bound as
+# `real[]` and cast with `::real[]::vector`, which pgvector's SQL installs.
+
+# Resource-server JWT validation. Audience and issuer are checked strictly:
+# a signature-valid token minted for a different resource server must be
+# rejected, or any token from the same IdP grants full access to the graph.
+#
+# `aws_lc_rs` rather than `rust_crypto`: jsonwebtoken v11 ships no crypto
+# backend by default and panics at the first signature check if neither feature
+# is on. aws-lc-rs is already in the tree via rustls, so this adds no new
+# supply-chain surface, and it avoids the RustCrypto `rsa` timing sidechannel
+# (RUSTSEC-2023-0071) entirely rather than relying on it being unreachable.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `uuid1` and `chrono04` so an `edge_id` and a `valid_from` reach a model's tool
+# schema as `format: uuid` and `format: date-time` rather than as bare strings.
+# Without them neither type implements `JsonSchema`, and the alternative —
+# carrying handles and instants as `String` and parsing by hand — puts the
+# format in a doc comment where nothing checks it.
+schemars = { version = "1", features = ["uuid1", "chrono04"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+sha2 = "0.10"
+subtle = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.23", optional = true }
+hf-hub = { version = "1.0", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+# Test-only RSA keygen, so JWT tests mint their own keypair at runtime and no
+# private key material is ever committed. Both are already in the tree, via
+# rustls and jsonwebtoken respectively.
+aws-lc-rs = "1"
+pem = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

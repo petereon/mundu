@@ -1,0 +1,1110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mundu — knowledge graph</title>
+<script src="/d3.min.js"></script>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2b3039;
+    --ink: #e6e8ec; --dim: #8b93a1; --accent: #6ea8fe; --warn: #e0685f;
+    /* One colour per relationship group, so the four graphs drawn on top of
+       one another are separable before anyone touches a switch. Chosen well
+       away from --warn (a red, and already the colour of a disputed fact) and
+       from --accent (a blue, and already the colour of a selected fact), so
+       neither meaning is ambiguous at a one-pixel stroke. */
+    --g-structure: #9d8df1; --g-dependency: #4fb3a5; --g-dataflow: #d9a441;
+    --g-operations: #cf7fc0; --g-other: #6d7686;
+  }
+  * { box-sizing: border-box; }
+  html { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
+    display: grid; grid-template-columns: 1fr 340px;
+    /* One explicit, full-height row. Left implicit the row is auto-sized and
+       only reaches the full viewport because align-content stretches it, so
+       any other child of <body> — a stray text node, a div injected by a
+       browser extension — becomes a second auto row, the two split the
+       viewport between them, and the graph is left in the top half of the
+       window. grid-auto-rows keeps any such intruder at zero height. */
+    grid-template-rows: 100%; grid-auto-rows: 0;
+    height: 100vh; height: 100dvh; overflow: hidden;
+  }
+  /* Placed explicitly for the same reason: auto-placement must not be able to
+     shuffle the stage or the panel out of the full-height row. */
+  #stage { grid-row: 1; grid-column: 1; position: relative; min-width: 0; overflow: hidden; }
+  /* Filling #stage by inset, not by a percentage height: a percentage height
+     on a replaced element (the SVG) inside a grid item is not reliably
+     resolvable and can collapse to the SVG's intrinsic 150px. Against an
+     absolutely positioned box the containing block is always definite. */
+  svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+  svg:active { cursor: grabbing; }
+
+  /* The controls and the filter panel are one stack, so the panel needs no
+     magic offset when the controls wrap onto a second line, and the whole
+     dock is bounded by the stage rather than running off the bottom.
+     pointer-events: none is not decoration: the dock's box is as tall as the
+     open panel and as wide as the controls, and while it is transparent it
+     would otherwise swallow every click, drag and wheel aimed at the graph
+     underneath it. Only the two boxes that are actually drawn take input. */
+  #dock {
+    position: absolute; top: 12px; left: 12px; z-index: 2;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+    max-height: calc(100% - 24px); max-width: calc(100% - 24px); min-height: 0;
+    pointer-events: none;
+  }
+  #controls, #panel { pointer-events: auto; }
+  #controls {
+    flex: 0 0 auto;
+    background: rgba(28,31,38,.94); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px;
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  }
+  #controls label { color: var(--dim); display: flex; gap: 6px; align-items: center; }
+  select, input[type=search] {
+    background: #12141a; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 5px; padding: 4px 7px; font: inherit;
+  }
+  button {
+    background: #242832; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 5px; padding: 3px 8px; font: inherit; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.on { background: #27344a; border-color: var(--accent); color: var(--ink); }
+  .linkish {
+    background: none; border: none; color: var(--dim);
+    padding: 0 3px; font: inherit; font-size: 11px; cursor: pointer;
+  }
+  .linkish:hover { color: var(--accent); border: none; }
+
+  #counts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #counts.filtered .readout { color: var(--ink); }
+  .chip {
+    display: inline-block; padding: 1px 7px; border-radius: 10px;
+    background: #27344a; color: var(--ink); font-size: 11px;
+  }
+
+  #panel {
+    flex: 0 1 auto; min-height: 0; overflow-y: auto; width: 288px;
+    background: rgba(28,31,38,.94); border: 1px solid var(--line);
+    border-radius: 8px; padding: 4px 12px 10px;
+  }
+  #panel[hidden] { display: none; }
+  .sec { border-top: 1px solid var(--line); padding: 9px 0 4px; }
+  .sec:first-child { border-top: none; }
+  .sec-head {
+    display: flex; gap: 6px; align-items: baseline;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--dim); font-weight: 600; margin-bottom: 6px;
+  }
+  .sec-head .state { text-transform: none; letter-spacing: 0; font-weight: 400;
+                     margin-left: auto; max-width: 170px; overflow: hidden;
+                     text-overflow: ellipsis; white-space: nowrap; }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .tip { color: var(--dim); font-size: 11px; margin: 6px 0 2px; }
+
+  .grp { margin-bottom: 5px; }
+  .grp-head, .type { display: flex; gap: 6px; align-items: center; }
+  .grp-head { font-weight: 600; }
+  .type { padding-left: 15px; }
+  .type label, .grp-head label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  .grp-head input, .type input { margin: 0; accent-color: var(--accent); }
+  .tname { font-size: 11px; letter-spacing: .2px; }
+  .count { color: var(--dim); font-size: 11px; margin-left: auto; }
+  .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  /* Isolating a group is the affordance the eighteen types exist to make
+     reachable, so it is always on show. The same button per type would be
+     eighteen more things to read, so that one waits for the pointer. */
+  .type .only { visibility: hidden; }
+  .type:hover .only { visibility: visible; }
+  .off .tname, .off .gname { color: var(--dim); text-decoration: line-through; }
+
+  #side {
+    grid-row: 1; grid-column: 2; min-height: 0;
+    background: var(--panel); border-left: 1px solid var(--line);
+    padding: 16px; overflow-y: auto;
+  }
+  h1 { font-size: 14px; margin: 0 0 2px; letter-spacing: .3px; }
+  h1 span { color: var(--dim); font-weight: 400; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+       color: var(--dim); margin: 18px 0 8px; font-weight: 600; }
+  .muted { color: var(--dim); }
+  .proof {
+    background: #12141a; border-left: 2px solid var(--accent);
+    padding: 9px 11px; border-radius: 0 5px 5px 0; margin: 6px 0 10px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+  dt { color: var(--dim); }
+  dd { margin: 0; word-break: break-all; }
+  .pill {
+    display: inline-block; padding: 1px 7px; border-radius: 10px;
+    background: #262a33; font-size: 11px; margin: 0 4px 4px 0;
+  }
+  .pill.warn { background: #40211f; color: var(--warn); }
+  .fact.hidden-by-filter { opacity: .45; }
+
+  .node circle { stroke: var(--bg); stroke-width: 1.5px; cursor: pointer; }
+  /* A dropped node is pinned where it was dropped, and says so: the dash is
+     the only thing that survives a re-layout, so it has to be legible. */
+  .node circle.pinned { stroke: var(--dim); stroke-dasharray: 2 2; }
+  .node circle.picked { stroke: var(--ink); stroke-width: 2px; }
+  .node circle.focused { stroke: var(--ink); stroke-width: 3.5px; }
+  .node text { fill: var(--ink); font-size: 11px; pointer-events: none;
+               paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
+  .link { stroke: #4a515e; fill: none; }
+  .link.g-structure { stroke: var(--g-structure); }
+  .link.g-dependency { stroke: var(--g-dependency); }
+  .link.g-dataflow { stroke: var(--g-dataflow); }
+  .link.g-operations { stroke: var(--g-operations); }
+  .link.g-other { stroke: var(--g-other); }
+  /* After the group colours on purpose: what is wrong with a fact outranks
+     what kind of fact it is, and what you have selected outranks both. */
+  .link.disputed { stroke: var(--warn); stroke-dasharray: 4 3; }
+  .link.superseded { stroke-dasharray: 2 4; opacity: .45; }
+  .link.selected { stroke: var(--accent); }
+  .linklabel { fill: var(--dim); font-size: 9px; pointer-events: none; }
+  .faded { opacity: .12; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="dock">
+    <div id="controls">
+      <label>tenant <select id="tenant"></select></label>
+      <label><input type="checkbox" id="history"> history</label>
+      <label><input type="search" id="find" placeholder="find entity…" size="14"></label>
+      <span id="counts" class="muted"></span>
+      <button id="panel-toggle" class="on" aria-expanded="true">filters</button>
+    </div>
+
+    <div id="panel">
+      <div class="sec">
+        <div class="sec-head">focus <span id="focus-state" class="state muted">whole graph</span></div>
+        <div class="row">
+          <button id="depth-1">1 hop</button>
+          <button id="depth-2">2 hops</button>
+          <button id="focus-clear" disabled>clear</button>
+        </div>
+        <p class="tip">Double-click a node — or use the detail panel — to walk out from it.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-head">selection <span id="selection-state" class="state muted">none picked</span></div>
+        <div class="row">
+          <button id="selection-isolate" disabled>isolate</button>
+          <button id="selection-expand" disabled>expand</button>
+          <button id="selection-clear" disabled>clear</button>
+        </div>
+        <p class="tip">Shift-click nodes to pick them.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-head">relationships
+          <span class="state"><button id="types-all" class="linkish">show all</button></span>
+        </div>
+        <div id="legend"></div>
+      </div>
+
+      <div class="sec">
+        <div class="row">
+          <button id="reset-all">reset filters</button>
+          <button id="unpin-all" disabled>release pinned</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <svg><g id="viewport"></g></svg>
+</div>
+
+<aside id="side">
+  <h1>mundu <span>knowledge graph</span></h1>
+  <p class="muted" id="hint">Click a fact to read the words that justify it.</p>
+  <div id="detail"></div>
+</aside>
+
+<script>
+"use strict";
+
+// Salience decays continuously, so a fact never disappears — it just thins out.
+// The floor keeps a forgotten-but-present edge visible rather than invisible,
+// which matches the store: salience ranks results, it never gates them.
+const OPACITY_FLOOR = 0.25;
+
+// A filter change moves an already-laid-out graph rather than laying one out
+// from nothing, so it is reheated to a fraction of a cold start: enough to
+// gather a subgraph into the middle of the stage, not enough to boil.
+const REHEAT_ALPHA = 0.4;
+
+// The eighteen relationship types in this tenant are really four graphs drawn
+// on top of one another, and this is the grouping. It is a hint, not a schema:
+// agents coin new types as they learn to describe a system (CONFIGURES and
+// OWNED_BY both appeared on one afternoon), so the legend is built from the
+// types actually in the data, and anything this table has never heard of is
+// listed under "other" with its count rather than quietly dropped.
+const TYPE_GROUPS = [
+  { id: "structure", label: "structure",
+    types: ["PART_OF", "OWNS", "OWNED_BY", "MEMBER_OF"] },
+  { id: "dependency", label: "dependency",
+    types: ["DEPENDS_ON", "USES", "PROXIES_TO", "AUTHENTICATES_WITH"] },
+  { id: "dataflow", label: "data flow",
+    types: ["PUBLISHES_TO", "CONSUMES_FROM", "PERSISTS_TO", "EMITS_METRICS_TO"] },
+  { id: "operations", label: "operations",
+    types: ["FAILURE_MODE_OF", "INCIDENT_ON", "DOCUMENTS", "CONFIGURES", "DEPLOYED_ON"] },
+  { id: "other", label: "other",
+    types: ["AUTHORED_BY", "RELATED_TO"] },
+];
+const FALLBACK_GROUP = "other";
+const GROUP_OF_TYPE = new Map();
+for (const group of TYPE_GROUPS) {
+  for (const type of group.types) GROUP_OF_TYPE.set(type, group.id);
+}
+function groupOf(type) {
+  return GROUP_OF_TYPE.get(type) || FALLBACK_GROUP;
+}
+
+const svg = d3.select("svg");
+const viewport = d3.select("#viewport");
+const detail = d3.select("#detail");
+const hint = d3.select("#hint");
+
+let simulation = null;
+let selectedEdge = null;
+let stageWidth = 0;
+let stageHeight = 0;
+let resizeFrame = null;
+
+// The whole tenant, loaded once. Everything the filters do is a subset of
+// these two arrays — never a reload, and never a copy, because d3-force keeps
+// each node's position on the object itself and reusing the object is what
+// stops a filter toggle from throwing the layout away.
+let allNodes = [];
+let allLinks = [];
+let nodeById = new Map();
+let incident = new Map();
+let totalNodes = 0;
+let totalLinks = 0;
+let droppedLinks = 0;
+
+// What is currently switched on. Read by computeVisible() and by nothing else,
+// so the visible set is a pure function of this state and never depends on the
+// order the filters were applied in.
+const disabledTypes = new Set();
+const picked = new Set();
+let focusId = null;
+let focusDepth = 1;
+let isolating = false;
+
+let visibleNodeIds = new Set();
+let visibleEdgeIds = new Set();
+let visibleLinkCount = 0;
+let legendGroups = [];
+let detailNodeId = null;
+let dragOrigin = null;
+let dragMoved = false;
+
+// The layers and the selections that live in them. Held here rather than on
+// window: the tick handler and every filter pass need them, and one global was
+// already one too many.
+let linkLayer = null;
+let labelLayer = null;
+let nodeLayer = null;
+let linkSel = null;
+let labelSel = null;
+let nodeSel = null;
+
+// The centre force needs a real measurement. getBoundingClientRect can still
+// read zero — a hidden tab, a layout that has not been performed yet — and a
+// zero centre parks the whole graph in the top-left corner, so fall back to
+// the stage box and then to the window rather than trusting a zero.
+function measureStage() {
+  const rect = svg.node().getBoundingClientRect();
+  const stage = document.getElementById("stage");
+  return {
+    width: rect.width || stage.clientWidth || window.innerWidth,
+    height: rect.height || stage.clientHeight || window.innerHeight,
+  };
+}
+
+// Where a re-solved layout should gather, in the coordinates the simulation
+// works in: the middle of what the operator can actually see.
+function viewCentre() {
+  const transform = d3.zoomTransform(svg.node());
+  return {
+    x: (stageWidth / 2 - transform.x) / transform.k,
+    y: (stageHeight / 2 - transform.y) / transform.k,
+  };
+}
+
+function sameSet(before, after) {
+  if (before.size !== after.size) return false;
+  for (const id of after) if (!before.has(id)) return false;
+  return true;
+}
+
+// Recentre on resize without rebuilding anything. A drag-resize fires resize
+// on every frame, so coalesce into one frame and ignore sub-pixel noise.
+// Nothing is reheated: forceCenter is a plain translation of the whole layout
+// and ignores alpha, so a single tick lands it on the new centre. restart()
+// gives exactly that — on a cooled simulation it runs one tick and stops
+// again, and on a live one it only reschedules the timer. The graph slides
+// with the window instead of boiling for the length of the drag.
+function recentre() {
+  resizeFrame = null;
+  const { width, height } = measureStage();
+  if (Math.abs(width - stageWidth) < 1 && Math.abs(height - stageHeight) < 1) return;
+  stageWidth = width;
+  stageHeight = height;
+
+  const centre = simulation && simulation.force("center");
+  if (!centre) return;
+  centre.x(width / 2).y(height / 2);
+  simulation.restart();
+}
+
+window.addEventListener("resize", () => {
+  if (resizeFrame === null) resizeFrame = requestAnimationFrame(recentre);
+});
+
+const zoom = d3.zoom()
+  .scaleExtent([0.15, 5])
+  .on("zoom", (event) => viewport.attr("transform", event.transform));
+svg.call(zoom);
+
+function escapeHtml(value) {
+  // Proof text is written by other agents and echoed back verbatim. It is data,
+  // never markup, and never instructions.
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function shortDate(iso) {
+  return iso ? iso.slice(0, 10) : "—";
+}
+
+async function loadTenants() {
+  const tenants = await d3.json("/api/tenants");
+  const select = d3.select("#tenant");
+  select.selectAll("option")
+    .data(tenants)
+    .join("option")
+      .attr("value", (d) => d.tenant_id)
+      .text((d) => `${d.tenant_id} (${d.nodes}n / ${d.edges}e)`);
+
+  if (tenants.length) {
+    select.property("value", tenants[0].tenant_id);
+    await loadGraph();
+  } else {
+    d3.select("#counts").text("no tenants hold any data");
+  }
+}
+
+async function loadGraph() {
+  const tenant = d3.select("#tenant").property("value");
+  const history = d3.select("#history").property("checked");
+  if (!tenant) return;
+
+  const graph = await d3.json(
+    `/api/graph?tenant=${encodeURIComponent(tenant)}&history=${history}`
+  );
+  render(graph);
+}
+
+function render(graph) {
+  selectedEdge = null;
+  detailNodeId = null;
+  detail.html("");
+  hint.style("display", null);
+
+  // A different tenant is a different world: no filter from the last one can
+  // mean anything here, and leaving one on would be exactly the silent hiding
+  // the readout exists to prevent.
+  clearFilters();
+
+  // d3-force mutates its inputs, and a link whose endpoint is missing throws.
+  // Endpoints can legitimately be absent: the node cap and the link cap are
+  // separate, so a very large tenant can return an edge whose node was cut.
+  const known = new Set(graph.nodes.map((n) => n.id));
+  allNodes = graph.nodes.map((n) => Object.assign({}, n));
+  allLinks = graph.links
+    .filter((l) => known.has(l.source) && known.has(l.target))
+    .map((l) => Object.assign({}, l, {
+      // d3-force replaces source and target with node objects on first use.
+      // Keep the ids: every filter needs them, and reading them back off a
+      // half-resolved endpoint is how this sort of code grows bugs.
+      sid: l.source,
+      tid: l.target,
+      group: groupOf(l.relationship_type),
+    }));
+
+  totalNodes = graph.nodes.length;
+  totalLinks = graph.links.length;
+  droppedLinks = graph.links.length - allLinks.length;
+
+  nodeById = new Map(allNodes.map((n) => [n.id, n]));
+  incident = new Map(allNodes.map((n) => [n.id, []]));
+  for (const link of allLinks) {
+    incident.get(link.sid).push(link);
+    incident.get(link.tid).push(link);
+  }
+
+  buildLegend();
+
+  viewport.selectAll("*").remove();
+  linkLayer = viewport.append("g");
+  labelLayer = viewport.append("g");
+  nodeLayer = viewport.append("g");
+  linkSel = linkLayer.selectAll("line");
+  labelSel = labelLayer.selectAll("text");
+  nodeSel = nodeLayer.selectAll("g");
+  visibleNodeIds = new Set();
+  visibleEdgeIds = new Set();
+
+  const { width, height } = measureStage();
+  stageWidth = width;
+  stageHeight = height;
+
+  simulation = d3.forceSimulation(allNodes)
+    .force("link", d3.forceLink([]).id((d) => d.id).distance(110).strength(0.5))
+    .force("charge", d3.forceManyBody().strength(-320))
+    .force("center", d3.forceCenter(width / 2, height / 2))
+    .force("collide", d3.forceCollide().radius(34))
+    .on("tick", ticked);
+
+  svg.on("click", () => {
+    selectedEdge = null;
+    detailNodeId = null;
+    if (linkSel) linkSel.attr("class", linkClass);
+    detail.html("");
+    hint.style("display", null);
+  });
+
+  draw();
+
+  // The size above is read during the same task that built the DOM. If that
+  // read happened before layout settled, correct the centre on the next frame;
+  // recentre() is a no-op when the measurement has not moved.
+  if (resizeFrame === null) resizeFrame = requestAnimationFrame(recentre);
+}
+
+function ticked() {
+  if (linkSel) {
+    linkSel
+      .attr("x1", (d) => d.source.x).attr("y1", (d) => d.source.y)
+      .attr("x2", (d) => d.target.x).attr("y2", (d) => d.target.y);
+  }
+  if (labelSel) {
+    labelSel
+      .attr("x", (d) => (d.source.x + d.target.x) / 2)
+      .attr("y", (d) => (d.source.y + d.target.y) / 2 - 3);
+  }
+  if (nodeSel) nodeSel.attr("transform", (d) => `translate(${d.x},${d.y})`);
+}
+
+// ---------------------------------------------------------------------------
+// What is visible
+//
+// Three filters, applied in one fixed order regardless of the order they were
+// switched on in, so the result is the same however you got there:
+//
+//   1. relationship types  — drop the facts you have switched off
+//   2. focus               — walk out from one entity over what is left
+//   3. isolate             — intersect with the entities you picked by hand
+//
+// All three hide rather than dim. The find box dims, because finding is a
+// "where is it" question and the answer is meaningless without the
+// surroundings. These three are "show me less" questions asked of a hairball,
+// and dimming answers neither half of it: the ink is still on the screen, and
+// — worse — the layout is still the layout of 251 nodes, so the ten nodes you
+// wanted stay flung to the corners they were assigned when they had 241
+// neighbours pushing them apart. Hiding lets the simulation re-solve for what
+// is left, which is the whole point.
+// ---------------------------------------------------------------------------
+function computeVisible() {
+  const typesFiltered = disabledTypes.size > 0;
+  const passesType = (link) => !disabledTypes.has(link.relationship_type);
+
+  let keep;
+  if (focusId && nodeById.has(focusId)) {
+    // Breadth-first over the facts that survived the type switches, so that
+    // "the neighbourhood" means the neighbourhood of the graph on the screen
+    // and not of some other graph you are not looking at.
+    keep = new Set([focusId]);
+    let frontier = [focusId];
+    for (let hop = 0; hop < focusDepth; hop++) {
+      const next = [];
+      for (const id of frontier) {
+        for (const link of incident.get(id)) {
+          if (!passesType(link)) continue;
+          const other = link.sid === id ? link.tid : link.sid;
+          if (!keep.has(other)) { keep.add(other); next.push(other); }
+        }
+      }
+      frontier = next;
+    }
+  } else {
+    keep = new Set(nodeById.keys());
+  }
+
+  if (isolating && picked.size) {
+    const kept = new Set();
+    for (const id of keep) if (picked.has(id)) kept.add(id);
+    keep = kept;
+  }
+
+  let links = allLinks.filter(
+    (l) => passesType(l) && keep.has(l.sid) && keep.has(l.tid));
+
+  if (typesFiltered) {
+    // Switching a type off should take the entities that existed only for it
+    // with it, or "structure only" is still 251 labels. An entity you focused
+    // or picked by hand stays regardless — you asked for it by name.
+    const touched = new Set();
+    for (const link of links) { touched.add(link.sid); touched.add(link.tid); }
+    const kept = new Set();
+    for (const id of keep) {
+      if (touched.has(id) || id === focusId || (isolating && picked.has(id))) kept.add(id);
+    }
+    keep = kept;
+  }
+
+  return { nodes: allNodes.filter((n) => keep.has(n.id)), links, ids: keep };
+}
+
+function anyFilterOn() {
+  return Boolean(focusId) || disabledTypes.size > 0 || (isolating && picked.size > 0);
+}
+
+function clearFilters() {
+  disabledTypes.clear();
+  picked.clear();
+  focusId = null;
+  focusDepth = 1;
+  isolating = false;
+}
+
+function radiusOf(d) {
+  // Sized by degree in the whole graph, not in the visible one: a hub must not
+  // shrink because you filtered away the reason it is a hub.
+  return 5 + Math.min(9, Math.sqrt(d.degree) * 3);
+}
+
+function linkClass(d) {
+  return "link g-" + d.group
+    + (d.disputed ? " disputed" : "")
+    + (d.status !== "active" ? " superseded" : "")
+    + (d.edge_id === selectedEdge ? " selected" : "");
+}
+
+function circleClass(d) {
+  return (d.pinned ? "pinned " : "")
+    + (picked.has(d.id) ? "picked " : "")
+    + (d.id === focusId ? "focused" : "");
+}
+
+const nodeDrag = d3.drag()
+  .on("start", (event, d) => {
+    if (!event.active) simulation.alphaTarget(0.3).restart();
+    dragOrigin = { x: event.x, y: event.y };
+    dragMoved = false;
+    d.fx = d.x; d.fy = d.y;
+  })
+  .on("drag", (event, d) => {
+    if (Math.hypot(event.x - dragOrigin.x, event.y - dragOrigin.y) > 2) dragMoved = true;
+    d.fx = event.x; d.fy = event.y;
+  })
+  .on("end", (event, d) => {
+    if (!event.active) simulation.alphaTarget(0);
+    // A node you dropped somewhere stays there, including across the re-layout
+    // that follows a filter change — otherwise every toggle would undo the
+    // arranging. A click is a zero-distance drag, so only a real one pins.
+    if (dragMoved) {
+      d.pinned = true;
+      d.fx = event.x; d.fy = event.y;
+    } else if (!d.pinned) {
+      d.fx = null; d.fy = null;
+    }
+    updateCircleState();
+    updatePinnedControl();
+  });
+
+function draw() {
+  const { nodes, links, ids } = computeVisible();
+  const edgeIds = new Set(links.map((l) => l.edge_id));
+  // Picking a node, selecting a fact, opening the panel: all of them redraw,
+  // and none of them changes what is on the screen. Only a real change to the
+  // visible set is allowed to disturb the layout — otherwise every shift-click
+  // would set the whole graph swimming.
+  const setChanged = !sameSet(visibleNodeIds, ids) || !sameSet(visibleEdgeIds, edgeIds);
+  visibleNodeIds = ids;
+  visibleEdgeIds = edgeIds;
+  visibleLinkCount = links.length;
+
+  linkSel = linkLayer.selectAll("line")
+    .data(links, (d) => d.edge_id)
+    .join((enter) => enter.append("line")
+      .attr("stroke-width", (d) => 1 + 2 * d.salience)
+      .attr("stroke-opacity", (d) => OPACITY_FLOOR + (1 - OPACITY_FLOOR) * d.salience)
+      .style("cursor", "pointer")
+      .on("click", (event, d) => { event.stopPropagation(); showFact(d); }));
+  linkSel.attr("class", linkClass);
+
+  labelSel = labelLayer.selectAll("text")
+    .data(links, (d) => d.edge_id)
+    .join((enter) => enter.append("text")
+      .attr("class", "linklabel")
+      .attr("text-anchor", "middle")
+      .text((d) => d.relationship_type));
+
+  nodeSel = nodeLayer.selectAll("g.node")
+    .data(nodes, (d) => d.id)
+    .join((enter) => {
+      const group = enter.append("g").attr("class", "node").call(nodeDrag);
+      group.append("circle")
+        .attr("r", radiusOf)
+        .attr("fill", (d) => d.degree === 0 ? "#3b414d" : "#6ea8fe")
+        .on("click", nodeClicked)
+        .on("dblclick", nodeDoubleClicked);
+      group.append("text")
+        .attr("x", 11).attr("dy", "0.35em")
+        .text((d) => d.label);
+      return group;
+    });
+  // Entering nodes already have coordinates — they are the same objects the
+  // simulation has been laying out all along — so place them now rather than
+  // letting them appear at the origin for one frame.
+  nodeSel.attr("transform", (d) => `translate(${d.x || 0},${d.y || 0})`);
+  updateCircleState();
+
+  if (setChanged) {
+    // Re-aim the simulation at the visible subgraph instead of building a new
+    // one: same node objects, same velocities, same pins, so a filter narrows
+    // the picture rather than shuffling it. Links are cleared first so the
+    // force never sees a link pointing at a node that has left the
+    // simulation. Then a gentle reheat — enough to gather ten nodes out of the
+    // coordinates they were given when they had 241 neighbours, not enough to
+    // throw away the arrangement.
+    simulation.force("link").links([]);
+    simulation.nodes(nodes);
+    simulation.force("link").links(links);
+
+    // Gather them where the operator is looking. The centre force works in
+    // graph coordinates, so with the view zoomed or panned, aiming at the
+    // stage centre can assemble the subgraph off the edge of the screen.
+    const centre = simulation.force("center");
+    const at = viewCentre();
+    if (centre) centre.x(at.x).y(at.y);
+
+    simulation.alpha(Math.max(simulation.alpha(), REHEAT_ALPHA)).restart();
+  }
+
+  applyFind();
+  updateReadout();
+  updateLegendState();
+  updateFilterControls();
+  updatePinnedControl();
+  refreshDetail();
+}
+
+function updateCircleState() {
+  if (nodeSel) nodeSel.select("circle").attr("class", circleClass);
+}
+
+// ---------------------------------------------------------------------------
+// Reading versus filtering
+//
+// A single click still means "tell me about this", exactly as it did: the
+// detail panel is a reading surface and losing it to a mode would be a bad
+// trade. Filtering is deliberate and separate — double-click to focus,
+// shift-click to pick — and the detail panel carries buttons for both, so
+// neither is a keyboard secret. Nothing about focusing or picking changes
+// what the panel is showing.
+// ---------------------------------------------------------------------------
+function nodeClicked(event, d) {
+  event.stopPropagation();
+  if (event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) {
+    togglePicked(d.id);
+    return;
+  }
+  showEntity(d);
+}
+
+function nodeDoubleClicked(event, d) {
+  // Stops d3-zoom, which is listening for a double-click on the svg above.
+  event.stopPropagation();
+  setFocus(d.id === focusId ? null : d.id);
+}
+
+function togglePicked(id) {
+  if (picked.has(id)) picked.delete(id); else picked.add(id);
+  if (!picked.size) isolating = false;
+  draw();
+}
+
+function setFocus(id) {
+  focusId = id;
+  draw();
+}
+
+function setDepth(depth) {
+  focusDepth = depth;
+  draw();
+}
+
+function updateFilterControls() {
+  const label = focusId && nodeById.has(focusId)
+    ? `${nodeById.get(focusId).label} · ${focusDepth} hop${focusDepth === 1 ? "" : "s"}`
+    : "whole graph";
+  d3.select("#focus-state").text(label).classed("muted", !focusId);
+  d3.select("#focus-clear").property("disabled", !focusId);
+  d3.select("#depth-1").classed("on", focusDepth === 1);
+  d3.select("#depth-2").classed("on", focusDepth === 2);
+
+  const shown = [...picked].filter((id) => visibleNodeIds.has(id)).length;
+  const state = picked.size
+    ? `${picked.size} picked${isolating && shown !== picked.size ? ` · ${picked.size - shown} hidden by other filters` : ""}`
+    : "none picked";
+  d3.select("#selection-state").text(state).classed("muted", !picked.size);
+  d3.select("#selection-isolate")
+    .property("disabled", !picked.size)
+    .classed("on", isolating)
+    .text(isolating ? "isolating" : "isolate");
+  d3.select("#selection-expand").property("disabled", !picked.size);
+  d3.select("#selection-clear").property("disabled", !picked.size);
+}
+
+function updatePinnedControl() {
+  const pinnedCount = allNodes.filter((n) => n.pinned).length;
+  d3.select("#unpin-all")
+    .property("disabled", pinnedCount === 0)
+    .text(pinnedCount ? `release ${pinnedCount} pinned` : "release pinned");
+}
+
+// ---------------------------------------------------------------------------
+// The readout. A filter you have forgotten about is a graph you will read
+// wrong, and this one gets read during incidents, so what is on the screen is
+// always stated against what exists, and the way back is always one click.
+// ---------------------------------------------------------------------------
+function updateReadout() {
+  const parts = [
+    `<span class="readout">showing ${visibleNodeIds.size} of ${totalNodes} entities`
+      + ` · ${visibleLinkCount} of ${totalLinks} facts</span>`,
+  ];
+  if (droppedLinks > 0) {
+    parts.push(`<span class="readout"> · ${droppedLinks} beyond the node cap</span>`);
+  }
+  if (focusId && nodeById.has(focusId)) {
+    parts.push(`<span class="chip">focus ${escapeHtml(nodeById.get(focusId).label)}`
+      + ` · ${focusDepth} hop${focusDepth === 1 ? "" : "s"}</span>`);
+  }
+  if (disabledTypes.size) {
+    const shownTypes = countedTypes() - disabledTypes.size;
+    parts.push(`<span class="chip">${shownTypes} of ${countedTypes()} types</span>`);
+  }
+  if (isolating && picked.size) {
+    parts.push(`<span class="chip">isolated · ${picked.size} picked</span>`);
+  }
+  if (anyFilterOn()) parts.push('<button id="reset-inline">reset</button>');
+
+  const counts = d3.select("#counts");
+  counts.html(parts.join(" ")).classed("filtered", anyFilterOn());
+  counts.select("#reset-inline").on("click", resetFilters);
+}
+
+function countedTypes() {
+  return legendGroups.reduce((total, group) => total + group.types.length, 0);
+}
+
+function resetFilters() {
+  clearFilters();
+  d3.select("#find").property("value", "");
+  draw();
+}
+
+// ---------------------------------------------------------------------------
+// The legend, built from the data. Types are counted as they are found, so a
+// type nobody has coined yet arrives with its count the first time an agent
+// writes one, and a type this page has never heard of lands in "other" rather
+// than in nothing.
+// ---------------------------------------------------------------------------
+function buildLegend() {
+  const counts = new Map();
+  for (const link of allLinks) {
+    counts.set(link.relationship_type, (counts.get(link.relationship_type) || 0) + 1);
+  }
+
+  const byGroup = new Map();
+  for (const [type, count] of counts) {
+    const id = groupOf(type);
+    if (!byGroup.has(id)) byGroup.set(id, []);
+    byGroup.get(id).push({ type, count });
+  }
+
+  legendGroups = TYPE_GROUPS
+    .filter((group) => byGroup.has(group.id))
+    .map((group) => {
+      const types = byGroup.get(group.id)
+        .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+      return {
+        id: group.id,
+        label: group.label,
+        types,
+        count: types.reduce((total, t) => total + t.count, 0),
+      };
+    });
+
+  const groups = d3.select("#legend").selectAll("div.grp")
+    .data(legendGroups, (d) => d.id)
+    .join((enter) => {
+      const grp = enter.append("div").attr("class", "grp");
+      const head = grp.append("div").attr("class", "grp-head");
+      const label = head.append("label");
+      label.append("input").attr("type", "checkbox").attr("class", "grp-box")
+        .on("change", (event, d) => setGroupEnabled(d, event.currentTarget.checked));
+      label.append("span").attr("class", "sw")
+        .style("background", (d) => `var(--g-${d.id})`);
+      label.append("span").attr("class", "gname").text((d) => d.label);
+      head.append("span").attr("class", "count").text((d) => d.count);
+      head.append("button").attr("class", "linkish only").text("only")
+        .attr("title", (d) => `show only ${d.label}`)
+        .on("click", (event, d) => onlyTypes(d.types.map((t) => t.type)));
+      grp.append("div").attr("class", "types");
+      return grp;
+    });
+  // On a reload the rows for types that still exist are reused, so the counts
+  // are written on every pass rather than only on the first one — a legend
+  // that says 90 when the tenant now holds 92 is the same lie as hiding.
+  groups.select(".grp-head .count").text((d) => d.count);
+
+  const rows = groups.select("div.types").selectAll("div.type")
+    .data((d) => d.types, (d) => d.type)
+    .join((enter) => {
+      const row = enter.append("div").attr("class", "type");
+      const label = row.append("label");
+      label.append("input").attr("type", "checkbox")
+        .on("change", (event, d) => setTypeEnabled(d.type, event.currentTarget.checked));
+      label.append("span").attr("class", "tname").text((d) => d.type);
+      row.append("span").attr("class", "count").text((d) => d.count);
+      row.append("button").attr("class", "linkish only").text("only")
+        .attr("title", (d) => `show only ${d.type}`)
+        .on("click", (event, d) => onlyTypes([d.type]));
+      return row;
+    });
+  rows.select("span.count").text((d) => d.count);
+}
+
+function updateLegendState() {
+  d3.select("#legend").selectAll("div.type").each(function (d) {
+    const on = !disabledTypes.has(d.type);
+    d3.select(this).classed("off", !on).select("input").property("checked", on);
+  });
+  d3.select("#legend").selectAll("div.grp").each(function (d) {
+    const on = d.types.filter((t) => !disabledTypes.has(t.type)).length;
+    const box = d3.select(this).select("input.grp-box");
+    box.property("checked", on > 0);
+    box.property("indeterminate", on > 0 && on < d.types.length);
+    d3.select(this).select(".grp-head").classed("off", on === 0);
+  });
+  d3.select("#types-all").property("disabled", disabledTypes.size === 0);
+}
+
+function setTypeEnabled(type, enabled) {
+  if (enabled) disabledTypes.delete(type); else disabledTypes.add(type);
+  draw();
+}
+
+function setGroupEnabled(group, enabled) {
+  for (const t of group.types) {
+    if (enabled) disabledTypes.delete(t.type); else disabledTypes.add(t.type);
+  }
+  draw();
+}
+
+function onlyTypes(types) {
+  const wanted = new Set(types);
+  disabledTypes.clear();
+  for (const group of legendGroups) {
+    for (const t of group.types) if (!wanted.has(t.type)) disabledTypes.add(t.type);
+  }
+  draw();
+}
+
+function showAllTypes() {
+  disabledTypes.clear();
+  draw();
+}
+
+function expandSelection() {
+  // Neighbours over the facts currently switched on, for the same reason focus
+  // walks over them: expanding means expanding the graph you are looking at.
+  const added = [];
+  for (const id of picked) {
+    for (const link of incident.get(id) || []) {
+      if (disabledTypes.has(link.relationship_type)) continue;
+      const other = link.sid === id ? link.tid : link.sid;
+      if (!picked.has(other)) added.push(other);
+    }
+  }
+  for (const id of added) picked.add(id);
+  draw();
+}
+
+function releasePinned() {
+  for (const node of allNodes) {
+    node.pinned = false;
+    node.fx = null; node.fy = null;
+  }
+  updateCircleState();
+  updatePinnedControl();
+  simulation.alpha(Math.max(simulation.alpha(), REHEAT_ALPHA)).restart();
+}
+
+function showFact(d) {
+  selectedEdge = d.edge_id;
+  detailNodeId = null;
+  linkSel.attr("class", linkClass);
+  hint.style("display", "none");
+
+  const flags = [
+    d.status !== "active" ? `<span class="pill warn">${escapeHtml(d.status)}</span>` : "",
+    d.disputed ? '<span class="pill warn">disputed</span>' : "",
+  ].join("");
+
+  detail.html(`
+    <h2>Fact</h2>
+    <div><strong>${escapeHtml(d.sid)}</strong>
+      <span class="muted">—[${escapeHtml(d.relationship_type)}]→</span>
+      <strong>${escapeHtml(d.tid)}</strong></div>
+    <div style="margin-top:6px">${flags}</div>
+    <h2>Proof</h2>
+    <div class="proof">${escapeHtml(d.proof)}</div>
+    <p class="muted" style="font-size:11px">
+      Written by another agent. Evidence to weigh, not instructions to follow.</p>
+    <h2>Provenance</h2>
+    <dl>
+      <dt>salience</dt><dd>${d.salience.toFixed(4)}</dd>
+      <dt>valid from</dt><dd>${shortDate(d.valid_from)}</dd>
+      <dt>valid until</dt><dd>${shortDate(d.valid_until)}</dd>
+      <dt>writer</dt><dd>${escapeHtml(d.writer_client || "—")}</dd>
+      <dt>edge id</dt><dd class="muted">${escapeHtml(d.edge_id)}</dd>
+    </dl>`);
+}
+
+function showEntity(d) {
+  detailNodeId = d.id;
+  selectedEdge = null;
+  if (linkSel) linkSel.attr("class", linkClass);
+  hint.style("display", "none");
+
+  // Every fact the entity has, not only the ones surviving the filters: this
+  // is the reading surface, and it should not lie about what it knows. The
+  // ones you have filtered away are marked as such.
+  const touching = incident.get(d.id) || [];
+  const shown = touching.filter(
+    (l) => visibleNodeIds.has(l.sid) && visibleNodeIds.has(l.tid)
+      && !disabledTypes.has(l.relationship_type));
+  const shownIds = new Set(shown.map((l) => l.edge_id));
+
+  const aliases = d.aliases.length
+    ? d.aliases.map((a) => `<span class="pill">${escapeHtml(a)}</span>`).join("")
+    : '<span class="muted">none</span>';
+
+  const hiddenNote = visibleNodeIds.has(d.id)
+    ? ""
+    : '<span class="pill warn">not shown by the current filters</span>';
+
+  detail.html(`
+    <h2>Entity</h2>
+    <div><strong>${escapeHtml(d.label)}</strong></div>
+    <div style="margin-top:6px">${hiddenNote}</div>
+    <div class="row" style="margin:8px 0">
+      <button id="entity-focus"></button>
+      <button id="entity-pick"></button>
+      <button id="entity-unpin" hidden>unpin</button>
+    </div>
+    <dl style="margin-top:6px">
+      <dt>node id</dt><dd class="muted">${escapeHtml(d.id)}</dd>
+      <dt>facts</dt><dd>${touching.length}${
+        shown.length === touching.length ? "" : ` <span class="muted">(${shown.length} shown)</span>`}</dd>
+    </dl>
+    <h2>Also known as</h2>
+    <div>${aliases}</div>
+    <h2>Facts</h2>
+    ${touching.map((l) => `
+      <div class="fact${shownIds.has(l.edge_id) ? "" : " hidden-by-filter"}" style="margin-bottom:5px">
+        <span class="muted">${l.sid === d.id ? "→" : "←"}</span>
+        ${escapeHtml(l.relationship_type)}
+        <span class="muted">${escapeHtml(l.sid === d.id ? l.tid : l.sid)}</span>
+      </div>`).join("") || '<span class="muted">none</span>'}`);
+
+  detail.select("#entity-focus")
+    .classed("on", focusId === d.id)
+    .text(focusId === d.id ? "clear focus" : `focus · ${focusDepth} hop${focusDepth === 1 ? "" : "s"}`)
+    .on("click", () => setFocus(focusId === d.id ? null : d.id));
+  detail.select("#entity-pick")
+    .classed("on", picked.has(d.id))
+    .text(picked.has(d.id) ? "unpick" : "add to selection")
+    .on("click", () => togglePicked(d.id));
+  detail.select("#entity-unpin")
+    .attr("hidden", d.pinned ? null : "")
+    .on("click", () => {
+      d.pinned = false; d.fx = null; d.fy = null;
+      updateCircleState();
+      updatePinnedControl();
+      refreshDetail();
+      simulation.alpha(Math.max(simulation.alpha(), REHEAT_ALPHA)).restart();
+    });
+}
+
+// Keeps the panel honest after a filter change: the buttons state what they
+// will do now, and a fact list marks what is no longer on the screen.
+function refreshDetail() {
+  if (detailNodeId && nodeById.has(detailNodeId)) showEntity(nodeById.get(detailNodeId));
+}
+
+function applyFind() {
+  const term = d3.select("#find").property("value").trim().toLowerCase();
+  viewport.selectAll(".node")
+    .classed("faded", (d) => term
+      && !d.label.toLowerCase().includes(term)
+      && !d.id.toLowerCase().includes(term));
+}
+
+d3.select("#tenant").on("change", loadGraph);
+d3.select("#history").on("change", loadGraph);
+d3.select("#find").on("input", applyFind);
+
+d3.select("#panel-toggle").on("click", function () {
+  const panel = d3.select("#panel");
+  const willOpen = panel.attr("hidden") !== null;
+  panel.attr("hidden", willOpen ? null : "");
+  d3.select(this).classed("on", willOpen).attr("aria-expanded", String(willOpen));
+});
+
+d3.select("#depth-1").on("click", () => setDepth(1));
+d3.select("#depth-2").on("click", () => setDepth(2));
+d3.select("#focus-clear").on("click", () => setFocus(null));
+d3.select("#selection-isolate").on("click", () => {
+  isolating = !isolating && picked.size > 0;
+  draw();
+});
+d3.select("#selection-expand").on("click", expandSelection);
+d3.select("#selection-clear").on("click", () => {
+  picked.clear();
+  isolating = false;
+  draw();
+});
+d3.select("#types-all").on("click", showAllTypes);
+d3.select("#reset-all").on("click", resetFilters);
+d3.select("#unpin-all").on("click", releasePinned);
+
+loadTenants().catch((error) => {
+  d3.select("#counts").text("failed to load: " + error.message);
+});
+</script>
+</body>
+</html>
