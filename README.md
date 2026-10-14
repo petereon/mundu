@@ -189,10 +189,12 @@ argument parsing. Note the bridge rewrites `clientInfo`, so writes arrive as
 ## Running it in Docker
 
 `docker compose up -d` brings up Postgres **and** the server. The `mundu` service needs a
-token, which compose reads from `.env` at the repo root (git-ignored):
+token and a signing key for [mid-call disambiguation](#mid-call-disambiguation-mrtr), which
+compose reads from `.env` at the repo root (git-ignored):
 
 ```bash
 printf 'MUNDU_STATIC_TOKENS=acme:%s\n' "$(openssl rand -hex 24)" > .env
+printf 'MUNDU_REQUEST_STATE_KEY=%s\n' "$(openssl rand -hex 32)" >> .env
 docker compose up -d
 ```
 

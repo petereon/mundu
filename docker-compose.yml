@@ -75,6 +75,13 @@ services:
       MUNDU_AUTH_MODE: "token"
       MUNDU_STATIC_TOKENS: "${MUNDU_STATIC_TOKENS:?set MUNDU_STATIC_TOKENS in .env}"
 
+      # Seals the disambiguation state the client echoes back. Without it
+      # upsert_node never asks which entity a contested name meant -- it mints a
+      # node and reports the near misses instead. The same key has to be on
+      # every instance: a per-process one opens its own states perfectly and
+      # refuses every one from a sibling.
+      MUNDU_REQUEST_STATE_KEY: "${MUNDU_REQUEST_STATE_KEY:?set MUNDU_REQUEST_STATE_KEY in .env}"
+
       # Every MCP client that exists today still negotiates 2025-11-25. Under
       # modern-only they complete `initialize` and then fail every call, which
       # looks like a working connection. See docs/plans/follow-ups.md.
@@ -83,6 +90,16 @@ services:
       # The listener is on 0.0.0.0 inside the container, but the Host header a
       # client sends is whatever it dialled on the host side.
       MUNDU_ALLOWED_HOSTS: "localhost,127.0.0.1,[::1],mundu"
+
+      # Merges duplicate entities on a timer. Off in config.rs unless asked for,
+      # because it rewrites the graph unsupervised and an over-merge is only
+      # undone by someone who noticed -- asked for here, deliberately. The
+      # automatic bar is stricter than the inline resolver's, so it can only
+      # catch pairs written when neither could see the other; every merge is
+      # reconstructable from node_merge/node_merge_edge. Left at the default
+      # schedule: a tenant is due after 10% growth or 4 hours, whichever comes
+      # first, checked every 5 minutes.
+      MUNDU_CONSOLIDATION: "on"
 
       RUST_LOG: "${RUST_LOG:-info}"
     volumes:
