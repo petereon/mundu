@@ -1,7 +1,6 @@
 # mundu
 
-A stateless [MCP](https://modelcontextprotocol.io) `2026-07-28` memory server, backed by a
-bi-temporal property graph and pgvector in Postgres. Written in Rust.
+A stateless [MCP](https://modelcontextprotocol.io) `2026-07-28` memory server, backed by a property graph and pgvector in Postgres. Written in Rust.
 
 Agents record entities and the facts connecting them, each fact carrying the words that
 justify it, and search them back later. Nothing is remembered between requests: the server
